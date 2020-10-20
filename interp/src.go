@@ -168,7 +168,7 @@ func (interp *Interpreter) importSrcArchive(reader io.Reader, skipTest bool) (st
 	var dir string
 	var err error
 	rPath := "."
-	importPath := "/"
+	importPath := "local"
 
 	// For relative import paths in the form "./xxx" or "../xxx", the initial
 	// base path is the directory of the interpreter input file, or "." if no file
