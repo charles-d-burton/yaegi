@@ -164,10 +164,26 @@ func (interp *Interpreter) importSrc(rPath, importPath string, skipTest bool) (s
 }
 
 func (interp *Interpreter) importSrcArchive(reader io.Reader, skipTest bool) (string, error) {
+	var dir string
 	var err error
 	rPath := "."
-	importPath := "/"
-	dir := filepath.Join(rPath, importPath)
+	importPath := "./"
+
+	if isPathRelative(importPath) {
+		if rPath == mainID {
+			rPath = "."
+		}
+		dir = filepath.Join(filepath.Dir(interp.name), rPath, importPath)
+	} else if dir, rPath, err = pkgDir(interp.context.GOPATH, rPath, importPath); err != nil {
+		// Try again, assuming a root dir at the source location.
+		if rPath, err = interp.rootFromSourceLocation(); err != nil {
+			return "", err
+		}
+		if dir, rPath, err = pkgDir(interp.context.GOPATH, rPath, importPath); err != nil {
+			return "", err
+		}
+	}
+	//dir := filepath.Join(rPath, importPath)
 	interp.rdir[importPath] = true
 
 	var initNodes []*node
@@ -224,9 +240,9 @@ func (interp *Interpreter) importSrcArchive(reader io.Reader, skipTest bool) (st
 			}
 			if pkgName == "" {
 				pkgName = pname
-			} /*else if pkgName != pname && skipTest {
+			} else if pkgName != pname && skipTest {
 				return "", fmt.Errorf("found packages %s and %s in %s", pkgName, pname, dir)
-			}*/
+			}
 			rootNodes = append(rootNodes, root)
 
 			subRPath := effectivePkg(rPath, importPath)
