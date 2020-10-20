@@ -222,11 +222,11 @@ func (interp *Interpreter) importSrcArchive(reader io.Reader, skipTest bool) (st
 				}
 				root.astDot(dotWriter(dotCmd), name)
 			}
-			if pkgName == "" {
+			/*if pkgName == "" {
 				pkgName = pname
 			} else if pkgName != pname && skipTest {
 				return "", fmt.Errorf("found packages %s and %s in %s", pkgName, pname, dir)
-			}
+			}*/
 			rootNodes = append(rootNodes, root)
 
 			subRPath := effectivePkg(rPath, importPath)
