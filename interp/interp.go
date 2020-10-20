@@ -394,6 +394,14 @@ func (interp *Interpreter) EvalPath(path string) (res reflect.Value, err error) 
 	return interp.eval(string(b), path, false)
 }
 
+// EvalTgz evaluates an io.Reader as a tgz file and returns the last result computed
+// by the interpreter, and a non nil error in case of failure.
+// The main function of the main package is executed if present
+func (interp *Interpreter) EvalTgz(reader io.Reader) (res reflect.Value, err error) {
+	_, err = interp.importSrcArchive(reader, NoTest)
+	return res, err
+}
+
 // EvalTest evaluates Go code located at path, including test files with "_test.go" suffix.
 // A non nil error is returned in case of failure.
 // The main function, test functions and benchmark functions are internally compiled but not

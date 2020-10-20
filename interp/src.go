@@ -1,7 +1,11 @@
 package interp
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -102,6 +106,138 @@ func (interp *Interpreter) importSrc(rPath, importPath string, skipTest bool) (s
 			return "", err
 		}
 		revisit[subRPath] = append(revisit[subRPath], list...)
+	}
+
+	// Revisit incomplete nodes where GTA could not complete.
+	for _, nodes := range revisit {
+		if err = interp.gtaRetry(nodes, importPath); err != nil {
+			return "", err
+		}
+	}
+
+	// Generate control flow graphs.
+	for _, root := range rootNodes {
+		var nodes []*node
+		if nodes, err = interp.cfg(root, importPath); err != nil {
+			return "", err
+		}
+		initNodes = append(initNodes, nodes...)
+	}
+
+	// Register source package in the interpreter. The package contains only
+	// the global symbols in the package scope.
+	interp.mutex.Lock()
+	gs := interp.scopes[importPath]
+	interp.srcPkg[importPath] = gs.sym
+	interp.pkgNames[importPath] = pkgName
+
+	interp.frame.mutex.Lock()
+	interp.resizeFrame()
+	interp.frame.mutex.Unlock()
+	interp.mutex.Unlock()
+
+	// Once all package sources have been parsed, execute entry points then init functions.
+	for _, n := range rootNodes {
+		if err = genRun(n); err != nil {
+			return "", err
+		}
+		interp.run(n, nil)
+	}
+
+	// Wire and execute global vars in global scope gs.
+	n, err := genGlobalVars(rootNodes, gs)
+	if err != nil {
+		return "", err
+	}
+	interp.run(n, nil)
+
+	// Add main to list of functions to run, after all inits.
+	if m := gs.sym[mainID]; pkgName == mainID && m != nil && skipTest {
+		initNodes = append(initNodes, m.node)
+	}
+
+	for _, n := range initNodes {
+		interp.run(n, interp.frame)
+	}
+
+	return pkgName, nil
+}
+
+func (interp *Interpreter) importSrcArchive(reader io.Reader, skipTest bool) (string, error) {
+	var err error
+	rPath := "."
+	importPath := "/"
+	dir := filepath.Join(rPath, importPath)
+	interp.rdir[importPath] = true
+
+	var initNodes []*node
+	var rootNodes []*node
+	revisit := make(map[string][]*node)
+
+	var root *node
+	var pkgName string
+
+	uncompressedStream, err := gzip.NewReader(reader)
+	if err != nil {
+		return "", err
+	}
+	tarReader := tar.NewReader(uncompressedStream)
+
+	// Parse source files.
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			fmt.Errorf("Not a tar file, %v", err)
+		}
+		switch header.Typeflag {
+		case tar.TypeDir:
+			//TODO: Need to see if this is necessary to implement
+		case tar.TypeReg:
+			name := header.Name
+			if skipFile(&interp.context, name, skipTest) {
+				continue
+			}
+
+			name = filepath.Join(dir, name)
+			var buf bytes.Buffer
+			if _, err = buf.ReadFrom(tarReader); err != nil {
+				return "", err
+			}
+
+			var pname string
+			if pname, root, err = interp.ast(string(buf.Bytes()), name, false); err != nil {
+				return "", err
+			}
+			if root == nil {
+				continue
+			}
+
+			if interp.astDot {
+				dotCmd := interp.dotCmd
+				if dotCmd == "" {
+					dotCmd = defaultDotCmd(name, "yaegi-ast-")
+				}
+				root.astDot(dotWriter(dotCmd), name)
+			}
+			if pkgName == "" {
+				pkgName = pname
+			} else if pkgName != pname && skipTest {
+				return "", fmt.Errorf("found packages %s and %s in %s", pkgName, pname, dir)
+			}
+			rootNodes = append(rootNodes, root)
+
+			subRPath := effectivePkg(rPath, importPath)
+			var list []*node
+			list, err = interp.gta(root, subRPath, importPath)
+			if err != nil {
+				return "", err
+			}
+			revisit[subRPath] = append(revisit[subRPath], list...)
+		}
+
 	}
 
 	// Revisit incomplete nodes where GTA could not complete.
