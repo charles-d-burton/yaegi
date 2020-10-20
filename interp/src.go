@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"fmt"
-	"go/build"
 	"io"
 	"io/ioutil"
 	"os"
@@ -34,16 +33,16 @@ func (interp *Interpreter) importSrc(rPath, importPath string, skipTest bool) (s
 	// In all other cases, absolute import paths are resolved from the GOPATH
 	// and the nested "vendor" directories.
 	if isPathRelative(importPath) {
-		if rPath == "main" {
+		if rPath == mainID {
 			rPath = "."
 		}
 		dir = filepath.Join(filepath.Dir(interp.name), rPath, importPath)
-	} else {
-		root, err := interp.rootFromSourceLocation(rPath)
-		if err != nil {
+	} else if dir, rPath, err = pkgDir(interp.context.GOPATH, rPath, importPath); err != nil {
+		// Try again, assuming a root dir at the source location.
+		if rPath, err = interp.rootFromSourceLocation(); err != nil {
 			return "", err
 		}
-		if dir, rPath, err = pkgDir(&interp.context, root, importPath); err != nil {
+		if dir, rPath, err = pkgDir(interp.context.GOPATH, rPath, importPath); err != nil {
 			return "", err
 		}
 	}
@@ -165,31 +164,10 @@ func (interp *Interpreter) importSrc(rPath, importPath string, skipTest bool) (s
 }
 
 func (interp *Interpreter) importSrcArchive(reader io.Reader, skipTest bool) (string, error) {
-	var dir string
 	var err error
 	rPath := "."
-	importPath := "local"
-
-	// For relative import paths in the form "./xxx" or "../xxx", the initial
-	// base path is the directory of the interpreter input file, or "." if no file
-	// was provided.
-	// In all other cases, absolute import paths are resolved from the GOPATH
-	// and the nested "vendor" directories.
-	if isPathRelative(importPath) {
-		if rPath == "main" {
-			rPath = "."
-		}
-		dir = filepath.Join(filepath.Dir(interp.name), rPath, importPath)
-	} else {
-		root, err := interp.rootFromSourceLocation(rPath)
-		if err != nil {
-			return "", err
-		}
-		if dir, rPath, err = pkgDir(&interp.context, root, importPath); err != nil {
-			return "", err
-		}
-	}
-	//dir := filepath.Join(rPath, importPath)
+	importPath := "/"
+	dir := filepath.Join(rPath, importPath)
 	interp.rdir[importPath] = true
 
 	var initNodes []*node
@@ -246,9 +224,9 @@ func (interp *Interpreter) importSrcArchive(reader io.Reader, skipTest bool) (st
 			}
 			if pkgName == "" {
 				pkgName = pname
-			} else if pkgName != pname && skipTest {
+			} /*else if pkgName != pname && skipTest {
 				return "", fmt.Errorf("found packages %s and %s in %s", pkgName, pname, dir)
-			}
+			}*/
 			rootNodes = append(rootNodes, root)
 
 			subRPath := effectivePkg(rPath, importPath)
@@ -320,10 +298,10 @@ func (interp *Interpreter) importSrcArchive(reader io.Reader, skipTest bool) (st
 // rootFromSourceLocation returns the path to the directory containing the input
 // Go file given to the interpreter, relative to $GOPATH/src.
 // It is meant to be called in the case when the initial input is a main package.
-func (interp *Interpreter) rootFromSourceLocation(rPath string) (string, error) {
+func (interp *Interpreter) rootFromSourceLocation() (string, error) {
 	sourceFile := interp.name
-	if rPath != "main" || !strings.HasSuffix(sourceFile, ".go") {
-		return rPath, nil
+	if sourceFile == DefaultSourceName {
+		return "", nil
 	}
 	wd, err := os.Getwd()
 	if err != nil {
@@ -339,40 +317,81 @@ func (interp *Interpreter) rootFromSourceLocation(rPath string) (string, error) 
 
 // pkgDir returns the absolute path in filesystem for a package given its import path
 // and the root of the subtree dependencies.
-// pkgDir returns the absolute path in filesystem for a package given its name and
-// the root of the subtree dependencies.
-func pkgDir(ctx *build.Context, root, path string) (pdir string, proot string, err error) {
+func pkgDir(goPath string, root, importPath string) (string, string, error) {
 	rPath := filepath.Join(root, "vendor")
-	dir := filepath.Join(ctx.GOPATH, "src", rPath, path)
+	dir := filepath.Join(goPath, "src", rPath, importPath)
+
 	if _, err := os.Stat(dir); err == nil {
 		return dir, rPath, nil // found!
 	}
 
-	dir = filepath.Join(ctx.GOPATH, "src", effectivePkg(root, path))
+	dir = filepath.Join(goPath, "src", effectivePkg(root, importPath))
+
 	if _, err := os.Stat(dir); err == nil {
 		return dir, root, nil // found!
 	}
 
 	if len(root) == 0 {
-		// for backwards compatibility behavior only use the 'normal' go
-		// package location when current implementation fails to discover
-		// the source.
-		if pkg, err := ctx.Import(path, ".", build.FindOnly); err == nil {
-			return pkg.Dir, pkg.Root, nil
-		}
-
-		return "", "", fmt.Errorf("unable to find source related to: %q", path)
+		return "", "", fmt.Errorf("unable to find source related to: %q", importPath)
 	}
 
-	return pkgDir(ctx, previousRoot(root), path)
+	rootPath := filepath.Join(goPath, "src", root)
+	prevRoot, err := previousRoot(rootPath, root)
+	if err != nil {
+		return "", "", err
+	}
+
+	return pkgDir(goPath, prevRoot, importPath)
 }
 
 const vendor = "vendor"
 
 // Find the previous source root (vendor > vendor > ... > GOPATH).
-func previousRoot(root string) string {
-	splitRoot := strings.Split(root, string(filepath.Separator))
+func previousRoot(rootPath, root string) (string, error) {
+	rootPath = filepath.Clean(rootPath)
+	parent, final := filepath.Split(rootPath)
+	parent = filepath.Clean(parent)
 
+	// TODO(mpl): maybe it works for the special case main, but can't be bothered for now.
+	if root != mainID && final != vendor {
+		root = strings.TrimSuffix(root, string(filepath.Separator))
+		prefix := strings.TrimSuffix(strings.TrimSuffix(rootPath, root), string(filepath.Separator))
+
+		// look for the closest vendor in one of our direct ancestors, as it takes priority.
+		var vendored string
+		for {
+			fi, err := os.Lstat(filepath.Join(parent, vendor))
+			if err == nil && fi.IsDir() {
+				vendored = strings.TrimPrefix(strings.TrimPrefix(parent, prefix), string(filepath.Separator))
+				break
+			}
+			if !os.IsNotExist(err) {
+				return "", err
+			}
+
+			// stop when we reach GOPATH/src/blah
+			parent = filepath.Dir(parent)
+			if parent == prefix {
+				break
+			}
+
+			// just an additional failsafe, stop if we reach the filesystem root, or dot (if
+			// we are dealing with relative paths).
+			// TODO(mpl): It should probably be a critical error actually,
+			// as we shouldn't have gone that high up in the tree.
+			if parent == string(filepath.Separator) || parent == "." {
+				break
+			}
+		}
+
+		if vendored != "" {
+			return vendored, nil
+		}
+	}
+
+	// TODO(mpl): the algorithm below might be redundant with the one above,
+	// but keeping it for now. Investigate/simplify/remove later.
+	splitRoot := strings.Split(root, string(filepath.Separator))
 	var index int
 	for i := len(splitRoot) - 1; i >= 0; i-- {
 		if splitRoot[i] == "vendor" {
@@ -382,10 +401,10 @@ func previousRoot(root string) string {
 	}
 
 	if index == 0 {
-		return ""
+		return "", nil
 	}
 
-	return filepath.Join(splitRoot[:index]...)
+	return filepath.Join(splitRoot[:index]...), nil
 }
 
 func effectivePkg(root, path string) string {
